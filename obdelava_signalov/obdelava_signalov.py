@@ -1,292 +1,355 @@
-import numpy as np
+import os
+import glob
+import re
 import struct
-import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy import signal as scipy_signal
 
-MERILO_ZIROSKOP = 8.75e-3
-MERILO_POSPESKOMETER = 6.125e-5
-MERILO_MAGNETOMETER = 1.5e-3 
+GYROSCOPE_SCALE = 8.75e-3
+ACCELEROMETER_SCALE = 6.125e-5
+MAGNETOMETER_SCALE = 1.5e-3
 
-ZLOGI_NA_VZOREC = {
-    1: 6,
-    2: 6,
-    3: 6
-}
+SCALES = {1: GYROSCOPE_SCALE, 2: ACCELEROMETER_SCALE, 3: MAGNETOMETER_SCALE}
+BYTES_PER_SAMPLE = {1: 6, 2: 6, 3: 6}
 
-class Paket:
-    def __init__(self, id, casovni_zig, podatki):
-        self.id = id
-        self.casovni_zig = casovni_zig
-        self.podatki = podatki
+SEGMENT_LENGTH = 5.0
+DOUBLE_THRESHOLD = 10.0
+SMOOTHING_WINDOW = 5
 
-def odstrani_escape_zloge(podatki):
-    rezultat = []
+
+def unstuff(data):
+    result = []
     i = 0
-
-    while i < len(podatki):
-        if podatki[i] == 0xFE:
+    while i < len(data):
+        if data[i] == 0xFE:
             i += 1
-            if i < len(podatki):
-                rezultat.append(0xFE ^ podatki[i])
+            if i < len(data):
+                result.append(0xFE ^ data[i])
         else:
-            rezultat.append(podatki[i])
+            result.append(data[i])
         i += 1
+    return bytes(result)
 
-    return bytes(rezultat)
 
-def razcleni_paket(paket_bajti):
+
+def parse_packet(raw):
+    """
+    Sprejme surove bajte enega paketa.
+    Vrne (timestamp_ms, [(chunk_id, chunk_data_bytes), ...]) ali None.
+    """
     try:
-        koristni_podatki_escape = paket_bajti[3:]
-        koristni_podatki = odstrani_escape_zloge(koristni_podatki_escape)
-
-        if len(koristni_podatki) < 8:
+        if len(raw) < 10:
             return None
-
-        casovni_zig = struct.unpack('<I', koristni_podatki[0:4])[0]
-
-        pozicija = 6
-        deli = []
-
-        while pozicija < len(koristni_podatki) - 2:
-            id_dela = koristni_podatki[pozicija]
-
-            velikost_dela = struct.unpack(
-                '<H',
-                koristni_podatki[pozicija+1:pozicija+3]
-            )[0] + 1
-
-            zacetek_podatkov = pozicija + 4
-            konec_podatkov = zacetek_podatkov + velikost_dela
-
-            if konec_podatkov > len(koristni_podatki):
+        timestamp = struct.unpack('<i', raw[3:7])[0]
+        pos = 9
+        chunks = []
+        while pos + 3 <= len(raw):
+            chunk_id = raw[pos]
+            stuffed_size = struct.unpack('<H', raw[pos + 1:pos + 3])[0]
+            data_start = pos + 3
+            data_end = data_start + stuffed_size
+            if data_end > len(raw):
                 break
-
-            podatki_dela = koristni_podatki[zacetek_podatkov:konec_podatkov]
-
-            deli.append((id_dela, podatki_dela))
-
-            pozicija = konec_podatkov
-
-        return casovni_zig, deli
-
-    except:
+            chunk_data = unstuff(raw[data_start:data_end])
+            chunks.append((chunk_id, chunk_data))
+            pos = data_end
+        if not chunks:
+            return None
+        return timestamp, chunks
+    except Exception:
         return None
 
-def dekodiraj_pakete(podatki):
-    paketi = []
 
+
+def decode_packets(raw):
+    """
+    Vrne list (timestamp_ms, chunk_id, chunk_data) za vse veljavne pakete.
+    """
+    packets = []
     i = 0
-
-    while i < len(podatki) - 1:
-        if podatki[i] == 0xFF and podatki[i+1] == 0xFF:
-            zacetek = i
-
+    while i < len(raw) - 1:
+        if raw[i] == 0xFF and raw[i + 1] == 0xFF:
             j = i + 2
-
-            while j < len(podatki) - 1:
-                if podatki[j] == 0xFF and podatki[j+1] == 0xFF:
+            while j < len(raw) - 1:
+                if raw[j] == 0xFF and raw[j + 1] == 0xFF:
                     break
                 j += 1
-
-            paket_bajti = podatki[zacetek:j]
-
-            razclenjen_paket = razcleni_paket(paket_bajti)
-
-            if razclenjen_paket:
-                casovni_zig, deli = razclenjen_paket
-
-                for id_dela, podatki_dela in deli:
-                    paketi.append(
-                        Paket(id_dela, casovni_zig, podatki_dela)
-                    )
-
+            paket_raw = raw[i:j]
+            parsed = parse_packet(paket_raw)
+            if parsed:
+                ts, chunks = parsed
+                for cid, cdata in chunks:
+                    packets.append((ts, cid, cdata))
             i = j
-
         else:
             i += 1
+    return packets
 
-    return paketi
 
-def sestavi_podatke(seznam_paketov):
-    rezultati = {}
 
-    ids = set()
+def assemble_signals(packets):
+    """
+    Returns dict: {sensor_id: (fs_Hz, matrix_Nx3)}
+    """
+    from collections import defaultdict
 
-    for paket in seznam_paketov:
-        ids.add(paket.id)
+    by_sensor = defaultdict(list)
+    for ts, cid, cdata in packets:
+        by_sensor[cid].append((ts, cdata))
 
-    for ciljni_id in ids:
-
-        paketi = []
-
-        for paket in seznam_paketov:
-            if paket.id == ciljni_id:
-                paketi.append(paket)
-
-        if len(paketi) < 2:
+    results = {}
+    for cid, sensor_data in by_sensor.items():
+        if len(sensor_data) < 2:
             continue
 
-        razlike_casa = []
+        bytes_per_sample = BYTES_PER_SAMPLE.get(cid, 6)
+        samples = []
+        timestamps = [ts for ts, _ in sensor_data]
 
-        for i in range(1, len(paketi)):
-            razlika = paketi[i].casovni_zig - paketi[i-1].casovni_zig
+        for ts, cdata in sensor_data:
+            n = len(cdata) // bytes_per_sample
+            for k in range(n):
+                chunk = cdata[k * bytes_per_sample:(k + 1) * bytes_per_sample]
+                if len(chunk) == 6:
+                    samples.append(struct.unpack('<3h', chunk))
 
-            if razlika > 0:
-                razlike_casa.append(razlika)
-
-        skupni_cas = 0.0
-        stevilo_casov = 0
-
-        for vrednost in razlike_casa:
-            skupni_cas += vrednost
-            stevilo_casov += 1
-
-        if stevilo_casov == 0:
+        if not samples:
             continue
 
-        povprecni_cas_paketa = (
-            skupni_cas / stevilo_casov
-        ) / 1000.0
+        differences = [
+            timestamps[i + 1] - timestamps[i]
+            for i in range(len(timestamps) - 1)
+            if timestamps[i + 1] - timestamps[i] > 0
+        ]
 
-        zlogi_na_vzorec = ZLOGI_NA_VZOREC.get(ciljni_id, 6)
-
-        vsi_vzorci = []
-        seznam_vzorcev = []
-
-        for paket in paketi:
-
-            stevilo_vzorcev = len(paket.podatki) // zlogi_na_vzorec
-
-            seznam_vzorcev.append(stevilo_vzorcev)
-
-            i = 0
-
-            while i + zlogi_na_vzorec <= len(paket.podatki):
-
-                if zlogi_na_vzorec == 6:
-                    vzorec = struct.unpack(
-                        '<hhh',
-                        paket.podatki[i:i+6]
-                    )
-
-                    vsi_vzorci.append(vzorec)
-
-                i += zlogi_na_vzorec
-
-        skupno_vzorcev = 0.0
-        stevilo_vrednosti = 0
-
-        for vrednost in seznam_vzorcev:
-            skupno_vzorcev += vrednost
-            stevilo_vrednosti += 1
-
-        if stevilo_vrednosti == 0 or povprecni_cas_paketa == 0:
+        if not differences:
             continue
 
-        povprecno_stevilo_vzorcev = (
-            skupno_vzorcev / stevilo_vrednosti
-        )
+        average_period_ms = sum(differences) / len(differences)
+        samples_per_packet = len(samples) / len(sensor_data)
+        fs = samples_per_packet / (average_period_ms / 1000.0)
 
-        frekvenca_vzorcenja = (
-            povprecno_stevilo_vzorcev / povprecni_cas_paketa
-        )
+        matrix = np.array(samples, dtype=float)
+        if cid in SCALES:
+            matrix *= SCALES[cid]
 
-        matrika = np.array(vsi_vzorci, dtype=float)
+        results[cid] = (fs, matrix)
 
-        if matrika.size > 0:
+    return results
 
-            if ciljni_id == 1:
-                matrika *= MERILO_ZIROSKOP
 
-            elif ciljni_id == 2:
-                matrika *= MERILO_POSPESKOMETER
 
-            elif ciljni_id == 3:
-                matrika *= MERILO_MAGNETOMETER
+def remove_dc(sig):
+    return sig - np.mean(sig, axis=0)
 
-        rezultati[ciljni_id] = (
-            frekvenca_vzorcenja,
-            matrika
-        )
 
-    return rezultati
 
-def prikazi_signal(
-    signal,
-    naslov="",
-    zacetni_indeks=None,
-    koncni_indeks=None
-):
+def center_signal(sig):
+    center = (np.max(sig, axis=0) + np.min(sig, axis=0)) / 2.0
+    return sig - center
 
-    if signal.size == 0:
-        return
 
-    if zacetni_indeks is None:
-        zacetni_indeks = 0
 
-    if koncni_indeks is None:
-        koncni_indeks = len(signal)
+def filter_noise(sig, fs, low=0.5, order=4):
+    min_samples = 3 * order * 2
+    if fs <= 2.0 or sig.shape[0] < min_samples:
+        return sig
 
-    signal = signal[zacetni_indeks:koncni_indeks]
+    nyq = fs / 2.0
+    high = nyq * 0.8
+    low = max(low, 0.01)
 
-    plt.plot(signal[:, 0], label="X")
-    plt.plot(signal[:, 1], label="Y")
-    plt.plot(signal[:, 2], label="Z")
-
-    plt.title(naslov)
-
-    plt.xlabel("Vzorec")
-    plt.ylabel("Vrednost")
-
-    plt.legend()
-    plt.grid(True)
-
-def main():
+    if low >= high or high >= nyq:
+        high = nyq * 0.99
+    if low >= high:
+        return sig
 
     try:
-        with open("luknja_3.BIN", "rb") as datoteka:
-            surovi_podatki = datoteka.read()
+        sos = scipy_signal.butter(order, [low / nyq, high / nyq], btype='bandpass', output='sos')
+        out = np.zeros_like(sig)
+        for axis_idx in range(sig.shape[1]):
+            out[:, axis_idx] = scipy_signal.sosfiltfilt(sos, sig[:, axis_idx])
+        return out
+    except Exception:
+        return sig
 
-    except FileNotFoundError:
-        print("Napaka: datoteka ni bila najdena!")
+
+
+def smooth_signal(sig, window=SMOOTHING_WINDOW):
+    if window < 2 or sig.shape[0] < window:
+        return sig
+
+    kernel = np.ones(window, dtype=float) / window
+    out = np.zeros_like(sig)
+
+    for axis_idx in range(sig.shape[1]):
+        out[:, axis_idx] = np.convolve(sig[:, axis_idx], kernel, mode='same')
+
+    return out
+
+
+
+def ask_yes_no(text, default=True):
+    default_hint = 'da' if default else 'ne'
+    allowed_yes = ('', 'd', 'da', 'y', 'yes') if default else ('d', 'da', 'y', 'yes')
+    allowed_no = ('n', 'ne', 'no') if default else ('', 'n', 'ne', 'no')
+
+    while True:
+        answer = input(f'{text} (da/ne, default: {default_hint}): ').strip().lower()
+        if answer in allowed_yes:
+            return True
+        if answer in allowed_no:
+            return False
+        print('Neveljaven vnos. Vpiši "da" ali "ne".')
+
+
+
+def ask_for_smoothing():
+    return ask_yes_no(
+        f'Želiš vključiti glajenje podatkov? Okno glajenja = {SMOOTHING_WINDOW}',
+        default=True,
+    )
+
+
+
+def ask_for_segmentation():
+    return ask_yes_no(
+        f'Želiš vključiti segmentiranje podatkov? Segment = {SEGMENT_LENGTH}s, dvojni prag = {DOUBLE_THRESHOLD}s',
+        default=True,
+    )
+
+
+
+def ask_for_labeling():
+    return ask_yes_no(
+        'Želiš vključiti labeling iz imena .bin datoteke?',
+        default=True,
+    )
+
+
+
+def normalize_amplitude(sig):
+    max_val = np.max(np.abs(sig))
+    return sig / max_val if max_val != 0 else sig
+
+
+
+def split_into_segments(sig, fs):
+    n = sig.shape[0]
+    t = n / fs
+    n_seg = int(round(SEGMENT_LENGTH * fs))
+
+    if t < SEGMENT_LENGTH:
+        return [sig]
+    elif t < DOUBLE_THRESHOLD:
+        return [sig[:n_seg]]
+    else:
+        mid = n // 2
+        s2 = max(0, mid - n_seg // 2)
+        e2 = min(n, s2 + n_seg)
+        if e2 - s2 < n_seg:
+            s2 = max(0, e2 - n_seg)
+        return [sig[:n_seg], sig[s2:e2]]
+
+
+
+def label_from_filename(filename):
+    """
+    - slaba_cesta  -> slaba_cesta
+    - slaba_cesta2 -> slaba_cesta
+    - slaba_cesta15 -> slaba_cesta
+    """
+    return re.sub(r'\d+$', '', filename)
+
+
+
+def main():
+    use_smoothing = ask_for_smoothing()
+    use_segmentation = ask_for_segmentation()
+    use_labeling = ask_for_labeling()
+
+    folder = os.path.dirname(os.path.abspath(__file__))
+    bin_files = sorted(
+        glob.glob(os.path.join(folder, '*.bin')) +
+        glob.glob(os.path.join(folder, '*.BIN'))
+    )
+
+    if not bin_files:
+        print('Ni najdenih .bin/.BIN datotek v mapi:', folder)
         return
 
-    paketi = dekodiraj_pakete(surovi_podatki)
+    output_folder = os.path.join(folder, 'out')
+    os.makedirs(output_folder, exist_ok=True)
 
-    rezultati = sestavi_podatke(paketi)
+    print(f'Najdenih {len(bin_files)} .bin/.BIN datotek.')
+    print(f'Izhod: {output_folder}')
+    print(f'Glajenje podatkov: {"vključeno" if use_smoothing else "izključeno"}')
+    print(f'Segmentiranje podatkov: {"vključeno" if use_segmentation else "izključeno"}')
+    print(f'Labeling podatkov: {"vključen" if use_labeling else "izključen"}\n')
 
-    for id_senzorja, (
-        frekvenca_vzorcenja,
-        signal
-    ) in rezultati.items():
+    for path in bin_files:
+        name = os.path.splitext(os.path.basename(path))[0]
+        label = label_from_filename(name) if use_labeling else None
 
-        plt.figure()
+        if use_labeling:
+            print(f'Obdelujem: {os.path.basename(path)} | label={label}')
+        else:
+            print(f'Obdelujem: {os.path.basename(path)}')
 
-        prikazi_signal(
-            signal,
-            f"Signal ID {id_senzorja} "
-            f"(Fvz = {frekvenca_vzorcenja:.2f} Hz)"
-        )
+        with open(path, 'rb') as f:
+            raw_data = f.read()
 
-    for id_senzorja, (
-        frekvenca_vzorcenja,
-        signal
-    ) in rezultati.items():
+        packets = decode_packets(raw_data)
+        results = assemble_signals(packets)
 
-        if frekvenca_vzorcenja > 0:
+        if not results:
+            print(' ✗ Ni bilo mogoče dekodirati signalov.\n')
+            continue
 
-            zacetek = int(2 * frekvenca_vzorcenja)
-            konec = int(5 * frekvenca_vzorcenja)
+        for cid, (fs, matrix) in results.items():
+            if cid == 3:
+                print(f' Preskakujem senzor ID={cid} (magnetometer)')
+                continue
+            if cid not in (1, 2):
+                print(f' Preskakujem senzor ID={cid} (neznan tip)')
+                continue
+            if matrix.shape[0] < 10 or fs < 2.0:
+                print(f' Preskakujem senzor ID={cid} (premalo podatkov: {matrix.shape[0]} vzorcev, fs={fs:.2f} Hz)')
+                continue
 
-            plt.figure()
+            t = matrix.shape[0] / fs
+            print(f' Senzor ID={cid} | fs={fs:.1f} Hz | vzorcev={matrix.shape[0]} | trajanje={t:.2f}s')
 
-            prikazi_signal(
-                signal,
-                f"Interval ID {id_senzorja} (2-5s)",
-                zacetek,
-                konec
-            )
+            sig = remove_dc(matrix)
+            sig = center_signal(sig)
+            sig = filter_noise(sig, fs)
+            if use_smoothing:
+                sig = smooth_signal(sig)
+            sig = normalize_amplitude(sig)
 
-    plt.show()
+            segments = split_into_segments(sig, fs) if use_segmentation else [sig]
 
-if __name__ == "__main__":
+            for idx, segment in enumerate(segments, start=1):
+                df = pd.DataFrame(segment, columns=['X', 'Y', 'Z'])
+                if use_labeling:
+                    df['label'] = label
+
+                if use_segmentation and len(segments) > 1:
+                    output_name = f'{name}_id{cid}_seg{idx}.csv'
+                else:
+                    output_name = f'{name}_id{cid}.csv'
+
+                output_path = os.path.join(output_folder, output_name)
+                df.to_csv(output_path, index=False)
+
+                if use_labeling:
+                    print(f' → {output_name} ({segment.shape[0]} vzorcev, label={label})')
+                else:
+                    print(f' → {output_name} ({segment.shape[0]} vzorcev)')
+
+        print()
+
+
+if __name__ == '__main__':
     main()
