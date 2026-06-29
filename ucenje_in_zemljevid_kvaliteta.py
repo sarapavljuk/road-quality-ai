@@ -6,8 +6,9 @@ import folium
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
 import os
+import matplotlib.pyplot as plt  # Dodano za izris grafa
 
-# --- KONFIGURACIJA ---
+
 UCNI_PODATKI_POT = 'data_out/train_dataset_original.csv'
 TESTNI_PODATKI_POT = 'data_out/inference_dolgi_gyro_only.BIN.csv'
 GPX_POT = 'test.gpx'
@@ -30,16 +31,59 @@ def treniraj_xgboost():
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
     print("\n2. Učenje XGBoost modela...")
-    model = xgb.XGBClassifier(eval_metric='logloss', random_state=42, n_estimators=100, max_depth=4)
-    model.fit(X_train, y_train)
+    
+    # POPRAVEK ZA OVERFITTING: 
+    # - max_depth zmanjšan na 3 (manj kompleksno drevo)
+    # - dodan learning_rate za bolj postopno učenje
+    # - dodana subsample in colsample_bytree (vzorčenje za večjo robustnost)
+    # - early_stopping_rounds=15 (ustavi učenje, če ni izboljšanja 15 iteracij zapored)
+    model = xgb.XGBClassifier(
+        eval_metric=['logloss', 'error'],  # 'error' potrebujemo za izračun natančnosti (Accuracy = 1 - error)
+        random_state=42, 
+        n_estimators=100, 
+        max_depth=3,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        early_stopping_rounds=15
+    )
+    
+
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_train, y_train), (X_val, y_val)],
+        verbose=False
+    )
 
     val_pred = model.predict(X_val)
     natančnost = accuracy_score(y_val, val_pred)
+    print(f"   Najboljša iteracija: {model.best_iteration}")
     print(f"   Natančnost modela na validacijski množici: {natančnost*100:.2f}%")
     print("\n Poročilo klasifikacije:\n", classification_report(y_val, val_pred))
 
+
+    evals_result = model.evals_result()
+    train_acc = [1 - err for err in evals_result['validation_0']['error']]
+    val_acc = [1 - err for err in evals_result['validation_1']['error']]
+    
+    plt.figure(figsize=(10, 6), dpi=150)
+    plt.plot(range(1, len(train_acc) + 1), train_acc, label='train accuracy', linewidth=2)
+    plt.plot(range(1, len(val_acc) + 1), val_acc, label='val accuracy', linewidth=2)
+    plt.title('Accuracy - kakovost ceste', fontsize=14)
+    plt.xlabel('Iteration', fontsize=12)
+    plt.ylabel('Accuracy', fontsize=12)
+    plt.legend(fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.5)
+    
+    graf_izhod = 'graf_kakovosti_ceste.png'
+    plt.savefig(graf_izhod, bbox_inches='tight')
+    print(f"   Graf uspešnosti je shranjen kot: {graf_izhod}")
+    plt.show()
+
     print("\n3. Izvajanje predikcije na dolgi.BIN...")
     X_inference = df_test[znacilke_za_ucenje]
+    
+    # Model avtomatsko uporabi najboljšo iteracijo (preden se je začel overfitting)
     verjetnosti = model.predict_proba(X_inference)[:, 1]
     napovedi = (verjetnosti >= PRAG_SLABO).astype(int)
     
@@ -115,4 +159,3 @@ if __name__ == "__main__":
         ustvari_zemljevid(rezultati_testne_voznje, gpx_df)
     else:
         print("Napaka - prazen rezultat datotek!")
-
