@@ -7,6 +7,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 import gpxpy
 import folium
+import matplotlib.pyplot as plt  # Dodano za izris grafa
 
 # --- NASTAVITVE ---
 TRAIN_CSV = "train_dataset.csv"
@@ -33,18 +34,44 @@ def treniraj_model():
     
     model = xgb.XGBClassifier(
         n_estimators=100,
-        max_depth=4,
+        max_depth=3,
         learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
         scale_pos_weight=razmerje,
         use_label_encoder=False,
-        eval_metric='logloss'
+        eval_metric=['logloss', 'error'],  # 'error' potrebujemo za izračun natančnosti (1 - error)
+        early_stopping_rounds=15
     )
     
-    model.fit(X_train, y_train)
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_train, y_train), (X_val, y_val)],
+        verbose=False
+    )
     
+    print(f"Najboljša iteracija: {model.best_iteration}")
     print("Ocena modela na validacijski množici:")
     preds_val = model.predict(X_val)
     print(classification_report(y_val, preds_val))
+    
+    evals_result = model.evals_result()
+    train_acc = [1 - err for err in evals_result['validation_0']['error']]
+    val_acc = [1 - err for err in evals_result['validation_1']['error']]
+    
+    plt.figure(figsize=(10, 6), dpi=150)
+    plt.plot(range(1, len(train_acc) + 1), train_acc, label='train accuracy', linewidth=2)
+    plt.plot(range(1, len(val_acc) + 1), val_acc, label='val accuracy', linewidth=2)
+    plt.title('Accuracy - ležeči policaji', fontsize=14)
+    plt.xlabel('Iteration', fontsize=12)
+    plt.ylabel('Accuracy', fontsize=12)
+    plt.legend(fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.5)
+    
+    graf_izhod = 'graf_lezeči_policaji.png'
+    plt.savefig(graf_izhod, bbox_inches='tight')
+    print(f"   Graf uspešnosti je shranjen kot: {graf_izhod}")
+    plt.show()
     
     return model, feature_cols
 
@@ -57,7 +84,7 @@ def isci_policaje_v_dolgi_voznji(model, feature_cols):
     
     verjetnosti = model.predict_proba(X_test)[:, 1] 
     
-    meja_zaupanja = 0.72
+    meja_zaupanja = 0.6
     zaznave_maska = verjetnosti > meja_zaupanja
     
     detektirani_casi = casi_oken[zaznave_maska]
@@ -77,7 +104,6 @@ def isci_policaje_v_dolgi_voznji(model, feature_cols):
         sredinski_cas = sum(trenutna_grupa) / len(trenutna_grupa)
         zdruzeni_policaji.append(sredinski_cas)
 
-
     zdruzeni_policaji = [t + 2.5 for t in zdruzeni_policaji]
 
     print(f"Najdenih SUROVIH zaznav (oken): {len(detektirani_casi)}")
@@ -87,13 +113,6 @@ def isci_policaje_v_dolgi_voznji(model, feature_cols):
     return zdruzeni_policaji
 
 def nalozi_in_mapiraj_gpx(detekcije_sekunde, korekcijski_faktor=0.71):
-    """
-    Parametri:
-    - detekcije_sekunde: seznam relativnih sekund, kdaj so detektirani policaji po logiki senzorja.
-    - korekcijski_faktor: Vrednost, s katero pomnožimo čas STM32, da ustreza GPX času.
-                          < 1.0 pomeni "skrči razdaljo" časa med njimi,
-                          > 1.0 pomeni "raztegni razdaljo" časa.
-    """
     print(f"\n--- 3. SINHRONIZACIJA Z GPS IN ZEMLJEVID (Faktor {korekcijski_faktor}) ---")
     with open(GPX_FILE, "r") as f:
         gpx = gpxpy.parse(f)
@@ -113,9 +132,7 @@ def nalozi_in_mapiraj_gpx(detekcije_sekunde, korekcijski_faktor=0.71):
     koordinate_policajev = []
     
     for relativna_sekunda in detekcije_sekunde:
-        
         korigirana_sekunda = relativna_sekunda * korekcijski_faktor
-        
         absolutni_cas_udarca = T0 + datetime.timedelta(seconds=korigirana_sekunda)
         
         najboljsa_tocka = None
@@ -165,6 +182,4 @@ if __name__ == "__main__":
          model, atributi = treniraj_model()
          casovne_znacke = isci_policaje_v_dolgi_voznji(model, atributi)
          
-         nalozi_in_mapiraj_gpx(casovne_znacke, korekcijski_faktor=0.71) 
-
-
+         nalozi_in_mapiraj_gpx(casovne_znacke, korekcijski_faktor=0.71)
