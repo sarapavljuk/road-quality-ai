@@ -32,13 +32,8 @@ def treniraj_xgboost():
 
     print("\n2. Učenje XGBoost modela...")
     
-    # POPRAVEK ZA OVERFITTING: 
-    # - max_depth zmanjšan na 3 (manj kompleksno drevo)
-    # - dodan learning_rate za bolj postopno učenje
-    # - dodana subsample in colsample_bytree (vzorčenje za večjo robustnost)
-    # - early_stopping_rounds=15 (ustavi učenje, če ni izboljšanja 15 iteracij zapored)
     model = xgb.XGBClassifier(
-        eval_metric=['logloss', 'error'],  # 'error' potrebujemo za izračun natančnosti (Accuracy = 1 - error)
+        eval_metric=['logloss', 'error'],
         random_state=42, 
         n_estimators=100, 
         max_depth=3,
@@ -83,7 +78,6 @@ def treniraj_xgboost():
     print("\n3. Izvajanje predikcije na dolgi.BIN...")
     X_inference = df_test[znacilke_za_ucenje]
     
-    # Model avtomatsko uporabi najboljšo iteracijo (preden se je začel overfitting)
     verjetnosti = model.predict_proba(X_inference)[:, 1]
     napovedi = (verjetnosti >= PRAG_SLABO).astype(int)
     
