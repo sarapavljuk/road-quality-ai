@@ -1,0 +1,67 @@
+name: Preverjanje predobdelave
+
+on:
+  push:
+    branches:
+      - develop
+      - "feature/**"
+      - "demo/**"
+  pull_request:
+    branches:
+      - develop
+
+jobs:
+  check-predobdelava:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repozitorija
+        uses: actions/checkout@v4
+
+      - name: Nastavitev Pythona
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Namestitev odvisnosti
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas scipy
+
+      - name: Preverjanje obstoja datoteke
+        run: |
+          test -f predobdelava_cnn/predobdelava.py
+
+      - name: Preverjanje sintakse
+        run: |
+          python -m py_compile predobdelava_cnn/predobdelava.py
+
+      - name: Osnovni test funkcij predobdelave
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import importlib.util
+
+          spec = importlib.util.spec_from_file_location(
+              "predobdelava",
+              "predobdelava_cnn/predobdelava.py"
+          )
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
+          data = np.random.rand(100, 3)
+
+          dc_removed = mod.remove_dc(data)
+          assert dc_removed.shape == data.shape
+
+          filtered = mod.filter_noise(data, fs=100)
+          assert filtered.shape == data.shape
+
+          segments = mod.split_into_segments(data, fs=100)
+          assert len(segments) >= 1
+
+          label = mod.label_from_filename("dobra_cesta12")
+          assert label == "dobra_cesta"
+
+          print("Preverjanje predobdelave uspešno.")
+          PY
